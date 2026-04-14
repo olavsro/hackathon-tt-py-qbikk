@@ -23,8 +23,11 @@ or reset the scaffold.
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
+import stat
 import sys
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).parent.parent.resolve()
@@ -33,13 +36,33 @@ TT_SCAFFOLD_DIR = REPO_ROOT / "tt" / "tt" / "scaffold" / "ghostfolio_pytx"
 DEFAULT_OUTPUT = REPO_ROOT / "translations" / "ghostfolio_pytx"
 
 
+def _rmtree_robust(path: Path) -> None:
+    """Remove a directory tree, retrying on Windows permission errors."""
+    def _on_error(func, path_str, exc_info):
+        try:
+            os.chmod(path_str, stat.S_IWRITE)
+            func(path_str)
+        except Exception:
+            pass
+
+    for attempt in range(5):
+        try:
+            shutil.rmtree(path, onerror=_on_error)
+            return
+        except PermissionError:
+            if attempt < 4:
+                time.sleep(1)
+            else:
+                raise
+
+
 def setup_scaffold(output_dir: Path) -> None:
     """Copy the example scaffold and tt support modules into output_dir."""
     # Step 1: Copy the example as the base (contains main.py, pyproject.toml)
-    if output_dir.exists():
-        shutil.rmtree(output_dir)
-    shutil.copytree(EXAMPLE_DIR, output_dir)
-    print(f"  Copied example scaffold → {output_dir}")
+    # Use dirs_exist_ok=True to overwrite in place — avoids Windows directory-lock
+    # issues (e.g. OneDrive holding a handle) that make rmtree fail.
+    shutil.copytree(EXAMPLE_DIR, output_dir, dirs_exist_ok=True)
+    print(f"  Copied example scaffold -> {output_dir}")
 
     # Step 2: Overlay tt scaffold support files (models, helpers, types, base classes)
     # These provide the interfaces that the translated calculator imports.

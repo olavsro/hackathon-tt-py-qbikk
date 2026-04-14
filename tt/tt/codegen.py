@@ -81,47 +81,63 @@ def translate_expression(ts_expr: str) -> str:
         return ""
 
     expr = _strip_trailing_semicolon(expr)
+    expr = _strip_await(expr)
+    expr = _strip_type_assertions(expr)
+    expr = _strip_non_null_assertions(expr)
     expr = expr.replace("this.", "self.")
-    expr = expr.replace("null", "None")
-    expr = expr.replace("true", "True")
-    expr = expr.replace("false", "False")
+    expr = re.sub(r"\bnull\b", "None", expr)
+    expr = re.sub(r"\btrue\b", "True", expr)
+    expr = re.sub(r"\bfalse\b", "False", expr)
     expr = re.sub(r"\bundefined\b", "None", expr)
     expr = _translate_template_literals(expr)
     expr = _translate_object_keys_entries(expr)
+    expr = _translate_math_functions(expr)
+    expr = _translate_number_functions(expr)
+    expr = _translate_array_functions(expr)
     expr = _translate_new_big(expr)
+    expr = _translate_nullish_assignment(expr)
     expr = _translate_nullish(expr)
     expr = _translate_optional_chaining(expr)
     expr = _translate_numeric_chain_methods(expr)
     expr = _translate_date_fns(expr)
     expr = _translate_lodash(expr)
     expr = _translate_arrow_functions(expr)
+    expr = _translate_ternary(expr)
     expr = _translate_type_keywords(expr)
     return expr
 
 
 def generate_helper_functions() -> str:
     """Return Python helper functions needed by the generated calculator."""
-    return (
-        "def each_day_of_interval(start, end):\n"
-        "    current = start\n"
-        "    while current <= end:\n"
-        "        yield current\n"
-        "        current = current + timedelta(days=1)\n"
-        "\n"
-        "def each_year_of_interval(start, end):\n"
-        "    current = start\n"
-        "    while current <= end:\n"
-        "        yield current\n"
-        "        current = current + relativedelta(years=1)\n"
-    )
+    lines = []
+    lines.append("def each_day_of_interval(start, end):")
+    lines.append("    current = start")
+    lines.append("    while current <= end:")
+    lines.append("        yield current")
+    lines.append("        current = current + timedelta(days=1)")
+    lines.append("")
+    lines.append("def _add_years(d, years):")
+    lines.append("    try:")
+    lines.append("        return d.replace(year=d.year + years)")
+    lines.append("    except ValueError:")
+    lines.append("        return d.replace(year=d.year + years, day=28)")
+    lines.append("")
+    lines.append("def each_year_of_interval(start, end):")
+    lines.append("    current = start")
+    lines.append("    while current <= end:")
+    lines.append("        yield current")
+    lines.append("        current = _add_years(current, 1)")
+    return "\n".join(lines) + "\n"
 
 
 def generate_method(method_node: MethodNode) -> str:
     """Generate a Python method definition from a parsed method node."""
-    method_name = camel_to_snake(method_node["name"])
+    ts_name = method_node["name"]
+    method_name = "__init__" if ts_name == "constructor" else camel_to_snake(ts_name)
     params = ["self"]
     for param in method_node.get("params", []):
-        params.append(_format_parameter(param["name"], param.get("ts_type", "")))
+        expanded = _expand_destructured_param(param["name"], param.get("ts_type", ""))
+        params.extend(expanded)
     signature = ", ".join(params)
     return_type = _map_ts_type(method_node.get("return_type", ""))
     header = f"    def {method_name}({signature})"
@@ -147,6 +163,44 @@ def _generate_properties(class_node: ClassNode) -> list[str]:
     return lines
 
 
+def _close_braces(line: str, emitted: list[str], block_stack: list[bool], indent: int) -> tuple[str, int]:
+    """Consume leading '}' characters, emitting 'pass' for empty blocks. Returns (remaining_line, new_indent)."""
+    while line.startswith("}"):
+        if block_stack and not block_stack[-1]:
+            emitted.append("    " * (indent + 1) + "pass")
+        if block_stack:
+            block_stack.pop()
+        indent = max(1, indent - 1)
+        line = line[1:].strip()
+    return line, indent
+
+
+def _handle_else_branch(line: str, emitted: list[str], block_stack: list[bool], indent: int) -> tuple[str, int]:
+    """Rewrite 'else if' -> 'elif' and 'else', popping the block stack. Returns (rewritten_line, new_indent)."""
+    if line.startswith("else if "):
+        if block_stack and not block_stack[-1]:
+            emitted.append("    " * (indent + 1) + "pass")
+        if block_stack:
+            block_stack.pop()
+        indent = max(1, indent - 1)
+        line = "elif " + line[len("else if "):]
+    elif line.startswith("else"):
+        if block_stack and not block_stack[-1]:
+            emitted.append("    " * (indent + 1) + "pass")
+        if block_stack:
+            block_stack.pop()
+        indent = max(1, indent - 1)
+    return line, indent
+
+
+def _flush_block_stack(emitted: list[str], block_stack: list[bool], indent: int) -> None:
+    """Emit 'pass' for any unclosed empty blocks remaining on the stack."""
+    while block_stack:
+        if not block_stack.pop():
+            emitted.append("    " * (indent + 1) + "pass")
+        indent = max(1, indent - 1)
+
+
 def _translate_body_lines(body_lines: list[str]) -> list[str]:
     emitted: list[str] = []
     indent = 2
@@ -158,33 +212,14 @@ def _translate_body_lines(body_lines: list[str]) -> list[str]:
             continue
 
         if line.startswith("}"):
-            while line.startswith("}"):
-                if block_stack and not block_stack[-1]:
-                    emitted.append("    " * (indent + 1) + "pass")
-                if block_stack:
-                    block_stack.pop()
-                indent = max(1, indent - 1)
-                line = line[1:].strip()
+            line, indent = _close_braces(line, emitted, block_stack, indent)
             if not line:
                 continue
 
         if line == "{":
             continue
 
-        if line.startswith("else if "):
-            if block_stack and not block_stack[-1]:
-                emitted.append("    " * (indent + 1) + "pass")
-            if block_stack:
-                block_stack.pop()
-            indent = max(1, indent - 1)
-            line = "elif " + line[len("else if ") :]
-
-        if line.startswith("else"):
-            if block_stack and not block_stack[-1]:
-                emitted.append("    " * (indent + 1) + "pass")
-            if block_stack:
-                block_stack.pop()
-            indent = max(1, indent - 1)
+        line, indent = _handle_else_branch(line, emitted, block_stack, indent)
 
         translated = _translate_statement(line)
         opens_block = translated.rstrip().endswith(":")
@@ -197,28 +232,12 @@ def _translate_body_lines(body_lines: list[str]) -> list[str]:
             block_stack.append(False)
             indent += 1
 
-    while block_stack:
-        if not block_stack.pop():
-            emitted.append("    " * (indent + 1) + "pass")
-        indent = max(1, indent - 1)
-
+    _flush_block_stack(emitted, block_stack, indent)
     return emitted
 
 
-def _translate_statement(line: str) -> str:
-    stripped = _strip_trailing_semicolon(line.strip())
-
-    if stripped in ("{", "}"):
-        return ""
-
-    if stripped.startswith("return "):
-        return f"return {translate_expression(stripped[len('return '):])}"
-    if stripped == "return":
-        return "return"
-
-    if stripped.startswith("const ") or stripped.startswith("let ") or stripped.startswith("var "):
-        return _translate_variable_declaration(stripped)
-
+def _translate_control_flow(stripped: str) -> str | None:
+    """Translate if/elif/else/for/while/try/catch/finally keywords. Returns None if not matched."""
     if stripped.startswith("if "):
         condition = _unwrap_parens(stripped[len("if "):]).rstrip("{").strip()
         return f"if {translate_expression(condition)}:"
@@ -232,16 +251,55 @@ def _translate_statement(line: str) -> str:
     if stripped.startswith("while "):
         condition = _unwrap_parens(stripped[len("while "):]).rstrip("{").strip()
         return f"while {translate_expression(condition)}:"
+    return None
+
+
+def _translate_exception_handling(stripped: str) -> str | None:
+    """Translate try/catch/finally keywords. Returns None if not matched."""
     if stripped.startswith("try"):
         return "try:"
     if stripped.startswith("catch "):
         capture = _unwrap_parens(stripped[len("catch "):]).strip() or "error"
+        capture = re.sub(r":\s*\S+$", "", capture).strip() or "error"
         return f"except Exception as {capture}:"
     if stripped.startswith("finally"):
         return "finally:"
+    return None
+
+
+def _translate_statement(line: str) -> str:
+    stripped = _strip_trailing_semicolon(line.strip())
+
+    if stripped in ("{", "}"):
+        return ""
+
+    if stripped.startswith("async "):
+        stripped = stripped[len("async "):].strip()
+
+    if stripped.startswith("return "):
+        return f"return {translate_expression(stripped[len('return '):])}"
+    if stripped == "return":
+        return "return"
+
+    if stripped.startswith("const ") or stripped.startswith("let ") or stripped.startswith("var "):
+        return _translate_variable_declaration(stripped)
+
+    control = _translate_control_flow(stripped)
+    if control is not None:
+        return control
+
+    exception = _translate_exception_handling(stripped)
+    if exception is not None:
+        return exception
 
     if stripped.startswith("//"):
         return f"# {stripped[2:].strip()}"
+
+    nullish_assign = re.match(r"^(\S+)\s*\?\?=\s*(.+)$", stripped)
+    if nullish_assign:
+        target = translate_expression(nullish_assign.group(1))
+        value = translate_expression(nullish_assign.group(2))
+        return f"if {target} is None: {target} = {value}"
 
     translated = translate_expression(stripped)
     if translated:
@@ -249,11 +307,24 @@ def _translate_statement(line: str) -> str:
     return f"# ts: {stripped}"
 
 
-def _translate_variable_declaration(line: str) -> str:
-    line = re.sub(r"^(const|let|var)\s+", "", line)
-    match = re.match(r"(?P<name>[^:=]+?)(?::\s*(?P<ts_type>.+?))?\s*=\s*(?P<value>.+)$", line)
-    if not match:
-        return f"# ts: {line}"
+def _translate_object_destructure(fields_raw: str, value: str) -> str:
+    """Translate object destructuring fields into semicolon-separated Python assignments."""
+    field_names = _parse_destructure_fields(fields_raw)
+    if "." not in value:
+        parts = [f"{camel_to_snake(f)} = {value}.get('{f}')" for f in field_names]
+    else:
+        parts = [f"{camel_to_snake(f)} = {value}['{f}']" for f in field_names]
+    return "; ".join(parts)
+
+
+def _translate_array_destructure(fields_raw: str, value: str) -> str:
+    """Translate array destructuring fields into a tuple-unpack Python assignment."""
+    targets = ", ".join(camel_to_snake(f.strip()) for f in fields_raw.split(","))
+    return f"{targets} = {value}"
+
+
+def _translate_typed_assignment(match: re.Match[str]) -> str:
+    """Translate a simple typed or untyped variable assignment match."""
     name = _normalize_identifier(match.group("name"))
     value = translate_expression(match.group("value"))
     ts_type = match.group("ts_type")
@@ -264,14 +335,101 @@ def _translate_variable_declaration(line: str) -> str:
     return f"{name} = {value}"
 
 
+def _translate_variable_declaration(line: str) -> str:
+    line = re.sub(r"^(const|let|var)\s+", "", line)
+
+    no_init = re.match(r"^(?P<name>[A-Za-z_$][A-Za-z0-9_$]*)\s*(?::\s*(?P<ts_type>.+?))?$", line.strip())
+    if no_init:
+        name = camel_to_snake(no_init.group("name"))
+        ts_type = no_init.group("ts_type") or ""
+        py_type = _map_ts_type(ts_type)
+        if py_type:
+            return f"{name}: {py_type} = None"
+        return f"{name} = None"
+
+    destructure = re.match(r"^\{(?P<fields>[^}]+)\}\s*(?::[^=]+)?\s*=\s*(?P<value>.+)$", line.strip())
+    if destructure:
+        value = translate_expression(destructure.group("value"))
+        return _translate_object_destructure(destructure.group("fields"), value)
+
+    arr_destructure = re.match(r"^\[(?P<fields>[^\]]+)\]\s*(?::[^=]+)?\s*=\s*(?P<value>.+)$", line.strip())
+    if arr_destructure:
+        value = translate_expression(arr_destructure.group("value"))
+        return _translate_array_destructure(arr_destructure.group("fields"), value)
+
+    match = re.match(r"(?P<name>[^:=]+?)(?::\s*(?P<ts_type>.+?))?\s*=\s*(?P<value>.+)$", line)
+    if not match:
+        return f"# ts: {line}"
+    return _translate_typed_assignment(match)
+
+
+def _translate_c_style_for(loop: str) -> str | None:
+    """Translate a C-style for loop (let i = 0; i < n; i++) into a Python range loop."""
+    c_style = re.match(
+        r"(let|var|const)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(\d+);\s*\2\s*<\s*(.+?);\s*\2\s*(?:\+=\s*(\d+)|(\+\+))",
+        loop,
+    )
+    if not c_style:
+        return None
+    var = camel_to_snake(c_style.group(2))
+    start = c_style.group(3)
+    end = translate_expression(c_style.group(4))
+    step = c_style.group(5) or "1"
+    if step == "1":
+        return f"for {var} in range({start}, {end}):"
+    return f"for {var} in range({start}, {end}, {step}):"
+
+
+def _translate_for_of_target(raw_target: str, iterable: str) -> str:
+    """Translate the target variable(s) of a for...of loop into a Python for statement."""
+    if raw_target.startswith("{") and raw_target.endswith("}"):
+        inner = raw_target[1:-1]
+        field_names = _parse_destructure_fields(inner)
+        target = ", ".join(camel_to_snake(f) for f in field_names)
+        return f"for {target} in ({iterable}):"
+    if raw_target.startswith("[") and raw_target.endswith("]"):
+        inner = raw_target[1:-1]
+        parts = [camel_to_snake(p.strip()) for p in inner.split(",")]
+        target = ", ".join(parts)
+        return f"for {target} in {iterable}:"
+    target = _normalize_identifier(raw_target)
+    return f"for {target} in {iterable}:"
+
+
+def _translate_for_of(loop: str, original_line: str) -> str:
+    """Translate a for...of loop into a Python for loop."""
+    match = re.match(r"(const|let|var)\s+(.+?)\s+of\s+(.+)", loop)
+    if not match:
+        return f"# ts: {original_line}"
+    raw_target = match.group(2).strip()
+    iterable_raw = match.group(3).strip()
+
+    entries_match = re.match(r"^(.+?)\.entries\(\)$", iterable_raw)
+    if entries_match:
+        iterable = translate_expression(entries_match.group(1))
+        if raw_target.startswith("[") and raw_target.endswith("]"):
+            inner = raw_target[1:-1]
+            parts = [camel_to_snake(p.strip()) for p in inner.split(",")]
+            target = ", ".join(parts)
+        else:
+            target = _normalize_identifier(raw_target)
+        return f"for {target} in enumerate({iterable}):"
+
+    iterable = translate_expression(iterable_raw)
+    return _translate_for_of_target(raw_target, iterable)
+
+
 def _translate_for_loop(line: str) -> str:
     loop = re.sub(r"^for\s*", "", line).rstrip("{").strip()
     loop = _unwrap_parens(loop)
-    match = re.match(r"(const|let|var)\s+(.+?)\s+of\s+(.+)", loop)
-    if match:
-        target = _normalize_identifier(match.group(2))
-        iterable = translate_expression(match.group(3))
-        return f"for {target} in {iterable}:"
+
+    c_result = _translate_c_style_for(loop)
+    if c_result is not None:
+        return c_result
+
+    if re.match(r"(const|let|var)\s+.+\s+of\s+", loop):
+        return _translate_for_of(loop, line)
+
     return f"# ts: {line}"
 
 
@@ -307,8 +465,170 @@ def _normalize_identifier(name: str) -> str:
     normalized = name.strip()
     if normalized.startswith("{") and normalized.endswith("}"):
         inner = normalized[1:-1].strip()
-        return inner.replace(":", "_").replace(",", "_")
+        fields = _parse_destructure_fields(inner)
+        return ", ".join(camel_to_snake(f) for f in fields)
+    if normalized.startswith("[") and normalized.endswith("]"):
+        inner = normalized[1:-1].strip()
+        parts = [camel_to_snake(p.strip()) for p in inner.split(",")]
+        return ", ".join(parts)
     return camel_to_snake(normalized) if re.match(r"[a-z]+[A-Z]", normalized) else normalized
+
+
+def _parse_destructure_fields(inner: str) -> list[str]:
+    """Parse fields from a destructured object literal like 'a, b: aliasB, c'."""
+    fields: list[str] = []
+    for part in inner.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        # Handle renaming: { key: localName } - take the localName
+        if ":" in part:
+            local = part.split(":", 1)[1].strip()
+        else:
+            local = part
+        # Strip default values: field = default
+        local = local.split("=")[0].strip()
+        if local:
+            fields.append(local)
+    return fields
+
+
+def _expand_destructured_param(name: str, ts_type: str) -> list[str]:
+    """Expand a destructured object parameter into individual Python params."""
+    stripped = name.strip()
+    if stripped.startswith("{") and stripped.endswith("}"):
+        inner = stripped[1:-1].strip()
+        fields = _parse_destructure_fields(inner)
+        result = []
+        for f in fields:
+            py_name = camel_to_snake(f)
+            result.append(py_name)
+        return result
+    # Normal parameter
+    return [_format_parameter(name, ts_type)]
+
+
+def _strip_await(expr: str) -> str:
+    """Remove 'await' keyword from expressions (async TS → sync Python)."""
+    return re.sub(r"\bawait\s+", "", expr)
+
+
+def _strip_type_assertions(expr: str) -> str:
+    """Remove TypeScript 'as Type' type assertions."""
+    # Handle: expr as Type (but not inside strings/templates)
+    # Remove ' as TypeName' where TypeName is an identifier or generic
+    return re.sub(r"\s+as\s+[A-Za-z_][A-Za-z0-9_<>\[\]|&,\s]*(?=[,)\]};:\s]|$)", "", expr)
+
+
+def _strip_non_null_assertions(expr: str) -> str:
+    """Remove TypeScript non-null assertion operator '!'.
+
+    The non-null assertion '!' appears directly after an identifier/paren/bracket
+    and is NOT followed by '=' (which would make it part of '!=' or '!==').
+    """
+    return re.sub(r"([A-Za-z0-9_\]\)])!(?!=)", r"\1", expr)
+
+
+def _translate_nullish_assignment(expr: str) -> str:
+    """Translate '??=' nullish assignment in expression context - handled in statement."""
+    return expr
+
+
+def _translate_math_functions(expr: str) -> str:
+    """Translate Math.* calls to Python builtins."""
+    expr = re.sub(r"\bMath\.abs\(", "abs(", expr)
+    expr = re.sub(r"\bMath\.min\(", "min(", expr)
+    expr = re.sub(r"\bMath\.max\(", "max(", expr)
+    expr = re.sub(r"\bMath\.floor\(", "math.floor(", expr)
+    expr = re.sub(r"\bMath\.ceil\(", "math.ceil(", expr)
+    expr = re.sub(r"\bMath\.round\(", "round(", expr)
+    expr = re.sub(r"\bMath\.sqrt\(", "math.sqrt(", expr)
+    expr = re.sub(r"\bMath\.pow\(([^,]+),\s*([^)]+)\)", r"(\1 ** \2)", expr)
+    expr = re.sub(r"\bMath\.PI\b", "math.pi", expr)
+    expr = re.sub(r"\bNumber\.EPSILON\b", "sys.float_info.epsilon", expr)
+    expr = re.sub(r"\bNumber\.isFinite\(", "math.isfinite(", expr)
+    expr = re.sub(r"\bNumber\.isNaN\(", "math.isnan(", expr)
+    expr = re.sub(r"\bNumber\.MAX_SAFE_INTEGER\b", "9007199254740991", expr)
+    return expr
+
+
+def _translate_number_functions(expr: str) -> str:
+    """Translate Number(), parseInt(), parseFloat() to Python equivalents."""
+    expr = re.sub(r"\bNumber\(([^)]+)\)", r"float(\1)", expr)
+    expr = re.sub(r"\bparseInt\(([^,)]+)(?:,\s*\d+)?\)", r"int(\1)", expr)
+    expr = re.sub(r"\bparseFloat\(([^)]+)\)", r"float(\1)", expr)
+    expr = re.sub(r"\bString\(([^)]+)\)", r"str(\1)", expr)
+    expr = re.sub(r"\bBoolean\(([^)]+)\)", r"bool(\1)", expr)
+    return expr
+
+
+def _translate_array_functions(expr: str) -> str:
+    """Translate Array.isArray() and spread syntax."""
+    expr = re.sub(r"\bArray\.isArray\(([^)]+)\)", r"isinstance(\1, list)", expr)
+    return expr
+
+
+def _translate_ternary(expr: str) -> str:
+    """Translate TypeScript ternary 'cond ? a : b' to Python 'a if cond else b'."""
+    # Only translate if there's exactly one unambiguous ? and matching :
+    # Use a simple pattern that avoids optional chaining (?.) and nullish (??)
+    # Strategy: find pattern "... ? ... : ..." not preceded by '?' or followed by '?' or '.'
+    try:
+        result = _convert_ternary(expr)
+        return result
+    except Exception:
+        return expr
+
+
+def _find_ternary_question(expr: str) -> int:
+    """Return the index of the first unambiguous '?' in expr at depth 0, or -1."""
+    depth = 0
+    for i, c in enumerate(expr):
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif c == "?" and depth == 0:
+            next_c = expr[i + 1] if i + 1 < len(expr) else ""
+            if next_c not in (".", "?"):
+                return i
+    return -1
+
+
+def _find_ternary_colon(rest: str) -> int:
+    """Return the index of the matching ':' in *rest* (the part after '?') at depth 0, or -1."""
+    depth = 0
+    for j, c in enumerate(rest):
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif c == ":" and depth == 0:
+            return j
+    return -1
+
+
+def _convert_ternary(expr: str) -> str:
+    """Convert C-style ternary to Python ternary, respecting nesting."""
+    q_pos = _find_ternary_question(expr)
+    if q_pos == -1:
+        return expr
+
+    condition = expr[:q_pos].strip()
+    rest = expr[q_pos + 1:]
+
+    c_pos = _find_ternary_colon(rest)
+    if c_pos == -1:
+        return expr
+
+    true_branch = rest[:c_pos].strip()
+    false_branch = rest[c_pos + 1:].strip()
+
+    py_cond = translate_expression(condition)
+    py_true = translate_expression(true_branch)
+    py_false = translate_expression(false_branch)
+
+    return f"({py_true} if {py_cond} else {py_false})"
 
 
 def _translate_new_big(expr: str) -> str:
@@ -355,12 +675,14 @@ def _translate_date_fns(expr: str) -> str:
         "endOfDay(": "end_of_day(",
         "startOfYear(": "start_of_year(",
         "endOfYear(": "end_of_year(",
-        "subDays(": "sub_days(",
         "addMilliseconds(": "add_milliseconds(",
     }
     for old, new in replacements.items():
         expr = expr.replace(old, new)
     expr = re.sub(r"format\((.+?),\s*DATE_FORMAT\)", r"\1.strftime('%Y-%m-%d')", expr)
+    # addDays / subDays → timedelta arithmetic
+    expr = re.sub(r"\baddDays\(([^,]+),\s*([^)]+)\)", r"(\1 + timedelta(days=\2))", expr)
+    expr = re.sub(r"\bsubDays\(([^,]+),\s*([^)]+)\)", r"(\1 - timedelta(days=\2))", expr)
     return expr
 
 
@@ -395,17 +717,22 @@ def _translate_template_literals(expr: str) -> str:
 
 
 def _translate_optional_chaining(expr: str) -> str:
-    while "?." in expr:
-        expr = re.sub(
+    for _ in range(50):  # safety cap: break if no regex matched (unhandled ?. pattern)
+        if "?." not in expr:
+            break
+        new_expr = re.sub(
             r"([A-Za-z0-9_\]\)]+)\?\.\[([^\]]+)\]",
             r"(\1.get(\2) if \1 is not None else None)",
             expr,
         )
-        expr = re.sub(
+        new_expr = re.sub(
             r"([A-Za-z0-9_\]\)]+)\?\.([A-Za-z_][A-Za-z0-9_]*)",
             r"(getattr(\1, '\2', None) if \1 is not None else None)",
-            expr,
+            new_expr,
         )
+        if new_expr == expr:
+            break  # no substitution made — remaining ?. is in an unhandled context
+        expr = new_expr
     return expr
 
 
@@ -418,7 +745,10 @@ def _translate_type_keywords(expr: str) -> str:
     expr = expr.replace("||", " or ")
     expr = expr.replace("!==", " != ")
     expr = re.sub(r"(?<![=!<>])===(?!=)", " == ", expr)
-    expr = expr.replace("!.", ".")
+    # Logical NOT: standalone '!' prefix (not part of '!=' or '!.')
+    expr = re.sub(r"(?<![=!<>])!(?![=.])\s*([A-Za-z_(])", r"not \1", expr)
+    # Spread operator: ...obj → **obj (works for both dict and iterable unpacking)
+    expr = re.sub(r"\.\.\.\s*([A-Za-z_][A-Za-z0-9_.]*)", r"**\1", expr)
     return expr
 
 
