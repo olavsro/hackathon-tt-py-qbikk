@@ -1,0 +1,31 @@
+{
+  "example_dir": "translations/ghostfolio_pytx_example",
+  "default_output": "translations/ghostfolio_pytx",
+  "ts_sources": [
+    "projects/ghostfolio/apps/api/src/app/portfolio/calculator/roai/portfolio-calculator.ts",
+    "projects/ghostfolio/apps/api/src/app/portfolio/calculator/portfolio-calculator.ts"
+  ],
+  "output_path": "app/implementation/portfolio/calculator/roai/portfolio_calculator.py",
+  "method_rename": {
+    "getPerformance": "get_performance",
+    "getInvestments": "get_investments",
+    "getInvestmentsByGroup": "_group_investments_by",
+    "computeSnapshot": "_compute_snapshot",
+    "getChartDateMap": "_get_chart_date_map",
+    "computeTransactionPoints": "_compute_transaction_points",
+    "getSymbolMetrics": "_get_symbol_metrics",
+    "calculateOverallPerformance": "_calculate_overall_performance",
+    "getPerformanceCalculationType": "_get_performance_calculation_type"
+  },
+  "method_order": [
+    "getPerformance",
+    "getInvestments",
+    "computeSnapshot",
+    "getChartDateMap",
+    "getInvestmentsByGroup",
+    "computeTransactionPoints",
+    "getSymbolMetrics",
+    "calculateOverallPerformance",
+    "getPerformanceCalculationType"
+  ]
+}
