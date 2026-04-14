@@ -78,6 +78,9 @@ def _write_output(source: str, output_file: Path) -> None:
     output_file.write_text(source, encoding="utf-8")
     print(f"  Written -> {output_file}")
 
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # New helpers — general-purpose, config-driven
