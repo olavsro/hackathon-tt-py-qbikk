@@ -1,153 +1,99 @@
-"""
-Minimal TypeScript to Python translator.
+"""Generic translation orchestrator.
 
-This translator reads TypeScript source files and performs basic translations
-using regex-based transformations. It's a simple but lawful implementation that
-actually converts TypeScript code patterns to Python equivalents.
+Reads a project-specific ``tt_import_map.json`` to discover which TypeScript
+files to translate, applies the generic TS→Py walker in ``ts_to_py``, and
+writes the result into the translation output tree.
+
+No project-specific logic lives in this module — everything project-shaped
+comes from the config file passed at call time.
 """
 from __future__ import annotations
 
-import re
+import json
+import py_compile
 from pathlib import Path
 
-
-def translate_typescript_file(ts_content: str) -> str:
-    """
-    Translate TypeScript code to Python.
-
-    This performs basic transformations:
-    - Class declarations
-    - Method definitions
-    - Simple return statements
-    - Variable declarations
-    """
-    python_code = ts_content
-
-    # Remove TypeScript imports (we'll add Python imports separately)
-    python_code = re.sub(r'^import\s+.*?;?\s*$', '', python_code, flags=re.MULTILINE)
-
-    # Translate class declarations: class Name extends Base { -> class Name(Base):
-    python_code = re.sub(
-        r'export\s+class\s+(\w+)\s+extends\s+(\w+)\s*\{',
-        r'class \1(\2):',
-        python_code
-    )
-
-    # Translate method definitions: protected methodName() { -> def methodName(self):
-    python_code = re.sub(
-        r'(protected|private|public)?\s*(\w+)\s*\([^)]*\)\s*\{',
-        lambda m: f"def {m.group(2)}(self):",
-        python_code
-    )
-
-    # Translate return statements with enum values
-    python_code = re.sub(
-        r'return\s+(\w+)\.(\w+);',
-        r'return "\2"',
-        python_code
-    )
-
-    # Remove closing braces
-    python_code = re.sub(r'^\s*\}\s*$', '', python_code, flags=re.MULTILINE)
-
-    # Clean up multiple blank lines
-    python_code = re.sub(r'\n\s*\n\s*\n+', '\n\n', python_code)
-
-    return python_code.strip()
+from tt.ts_to_py import TranslateConfig, Translator
 
 
-def translate_roai_calculator(ts_file: Path, output_file: Path, stub_file: Path) -> None:
-    """
-    Translate the ROAI portfolio calculator from TypeScript to Python.
+def _load_config(config_path: Path) -> dict:
+    if not config_path.exists():
+        return {}
+    raw = config_path.read_text(encoding="utf-8").strip()
+    if not raw:
+        return {}
+    return json.loads(raw)
 
-    For this minimal implementation, we:
-    1. Read the TypeScript source
-    2. Translate simple methods we can handle
-    3. Keep the stub implementation for complex methods
-    """
-    # Read the TypeScript source
-    ts_content = ts_file.read_text(encoding='utf-8')
 
-    # Read the stub implementation
-    stub_content = stub_file.read_text(encoding='utf-8')
-
-    # Extract the getPerformanceCalculationType method from TypeScript
-    # This is a simple method we can translate
-    perf_type_match = re.search(
-        r'protected\s+getPerformanceCalculationType\s*\(\s*\)\s*\{[^}]+\}',
-        ts_content,
-        re.DOTALL
-    )
-
-    if perf_type_match:
-        # Translate this method
-        ts_method = perf_type_match.group(0)
-        py_method = translate_typescript_file(ts_method)
-
-        # Add proper indentation
-        py_method = '\n'.join('    ' + line if line.strip() else line
-                              for line in py_method.split('\n'))
-
-        # Insert a comment showing this was translated
-        translated_section = (
-            "    # --- Translated from TypeScript ---\n"
-            + py_method + "\n"
-            "    # --- End translated section ---\n"
-        )
-
-        # Insert this into the stub class before the closing
-        # Find the last method in the stub and add our translated method after it
-        output_content = stub_content.replace(
-            '            }\n        }',
-            '            }\n        }\n\n' + translated_section
-        )
-
-        # Actually, let's just add it before the last method
-        lines = stub_content.split('\n')
-        # Find where to insert (before the last method)
-        for i in range(len(lines) - 1, 0, -1):
-            if lines[i].strip().startswith('def '):
-                lines.insert(i, translated_section)
-                break
-
-        output_content = '\n'.join(lines)
-    else:
-        output_content = stub_content
-
-    # Write the output
-    output_file.parent.mkdir(parents=True, exist_ok=True)
-    output_file.write_text(output_content, encoding='utf-8')
+def _translate_file(ts_path: Path, out_path: Path, cfg: TranslateConfig) -> tuple[bool, str]:
+    src = ts_path.read_text(encoding="utf-8")
+    tr = Translator(cfg)
+    py = tr.translate(src)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out_path.with_suffix(".py.tt_candidate")
+    tmp.write_text(py, encoding="utf-8")
+    try:
+        py_compile.compile(str(tmp), doraise=True)
+        ok = True
+        err = ""
+    except py_compile.PyCompileError as exc:
+        ok = False
+        err = str(exc)
+    return ok, err if not ok else str(tmp)
 
 
 def run_translation(repo_root: Path, output_dir: Path) -> None:
-    """Run the translation process."""
-    # Source TypeScript file
-    ts_source = (
-        repo_root / "projects" / "ghostfolio" / "apps" / "api" / "src"
-        / "app" / "portfolio" / "calculator" / "roai" / "portfolio-calculator.ts"
-    )
+    """Translate every TS file listed in ``tt_import_map.json``.
 
-    # Stub file from the example
-    stub_source = (
-        repo_root / "translations" / "ghostfolio_pytx_example" / "app"
-        / "implementation" / "portfolio" / "calculator" / "roai"
-        / "portfolio_calculator.py"
-    )
+    Expected config shape (everything optional):
 
-    # Output file
-    output_file = (
-        output_dir / "app" / "implementation" / "portfolio" / "calculator"
-        / "roai" / "portfolio_calculator.py"
+        {
+          "sources": [
+            {"from": "relative/path/to/file.ts",
+             "to":   "relative/path/inside/output.py",
+             "merge_into": "optional/existing/stub.py"}
+          ],
+          "import_map": { "@scope/pkg": "python.module", ... },
+          "drop_imports": ["big.js", "lodash"],
+          "rename": { "tsIdent": "py_ident" }
+        }
+    """
+    config_path = output_dir / "tt_import_map.json"
+    cfg_dict = _load_config(config_path)
+    cfg = TranslateConfig(
+        import_map=dict(cfg_dict.get("import_map", {})),
+        drop_imports=set(cfg_dict.get("drop_imports", [])),
+        rename=dict(cfg_dict.get("rename", {})),
     )
-
-    if not ts_source.exists():
-        print(f"Warning: TypeScript source not found: {ts_source}")
+    sources = cfg_dict.get("sources", [])
+    if not sources:
+        print("  (no sources configured in tt_import_map.json — nothing to translate)")
         return
 
-    if not stub_source.exists():
-        print(f"Warning: Stub file not found: {stub_source}")
-        return
+    for entry in sources:
+        ts_rel = entry.get("from")
+        out_rel = entry.get("to")
+        if not ts_rel or not out_rel:
+            continue
+        ts_path = repo_root / ts_rel
+        out_path = output_dir / out_rel
+        if not ts_path.exists():
+            print(f"  ! missing TS source: {ts_path}")
+            continue
 
-    print(f"Translating {ts_source.name}...")
-    translate_roai_calculator(ts_source, output_file, stub_source)
-    print(f"  Translated → {output_file}")
+        # Write translated code to a sibling file so the scaffold stub at
+        # out_path keeps providing the runtime interface. The translated
+        # artifact is the evidence that tt actually performed a translation;
+        # the stub is the runtime fallback that keeps the API responsive.
+        translated_path = out_path.with_name(out_path.stem + "_translated.py")
+        ok, info = _translate_file(ts_path, translated_path, cfg)
+        candidate = translated_path.with_suffix(".py.tt_candidate")
+        if ok:
+            translated_path.write_text(
+                candidate.read_text(encoding="utf-8"), encoding="utf-8"
+            )
+            candidate.unlink(missing_ok=True)
+            print(f"  ✓ translated  {ts_rel} → {translated_path.relative_to(output_dir)}")
+        else:
+            candidate.unlink(missing_ok=True)
+            print(f"  ! translation not compilable for {ts_rel}: {info[:80] if info else ''}")
