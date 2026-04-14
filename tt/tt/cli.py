@@ -10,30 +10,19 @@ This allows the translated version to pass all tests that the example passes.
 from __future__ import annotations
 
 import argparse
-import shutil
-import subprocess
 import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).parent.parent.parent.resolve()
 TRANSLATION_DIR = REPO_ROOT / "translations" / "ghostfolio_pytx"
-EXAMPLE_DIR = REPO_ROOT / "translations" / "ghostfolio_pytx_example"
 
 
 def cmd_translate(args: argparse.Namespace) -> int:
     output_dir = Path(args.output) if args.output else TRANSLATION_DIR
 
     # Step 1: Set up the scaffold (copies example + support modules)
-    setup_script = REPO_ROOT / "helptools" / "setup_ghostfolio_scaffold_for_tt.py"
-    if not setup_script.exists():
-        print(f"ERROR: setup script not found: {setup_script}", file=sys.stderr)
-        return 1
-
-    print(f"Setting up scaffold → {output_dir}")
-    subprocess.run(
-        [sys.executable, str(setup_script), "--output", str(output_dir)],
-        check=True,
-    )
+    from tt.runner import setup_scaffold
+    setup_scaffold(REPO_ROOT, output_dir)
 
     # Step 2: Run the actual translation
     print(f"\nTranslating TypeScript to Python...")
