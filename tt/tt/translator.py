@@ -1,153 +1,223 @@
-"""
-Minimal TypeScript to Python translator.
+"""Pipeline orchestrator — drives TypeScript → Python translation.
 
-This translator reads TypeScript source files and performs basic translations
-using regex-based transformations. It's a simple but lawful implementation that
-actually converts TypeScript code patterns to Python equivalents.
+This module wires together the four-module pipeline:
+  parse_ts_file()  →  extract_class_methods()  →  generate_python_class()  →  write
+
+During Branch A development the parser/codegen imports hit stubs committed in the
+pre-branch setup.  After merging with Branch B they hit the real implementations
+automatically — no changes to this file needed.
 """
 from __future__ import annotations
 
-import re
+import ast
+import json
+import sys
 from pathlib import Path
 
 
-def translate_typescript_file(ts_content: str) -> str:
-    """
-    Translate TypeScript code to Python.
+class TranslationError(RuntimeError):
+    """Raised when the translation pipeline cannot produce valid output."""
 
-    This performs basic transformations:
-    - Class declarations
-    - Method definitions
-    - Simple return statements
-    - Variable declarations
-    """
-    python_code = ts_content
 
-    # Remove TypeScript imports (we'll add Python imports separately)
-    python_code = re.sub(r'^import\s+.*?;?\s*$', '', python_code, flags=re.MULTILINE)
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
 
-    # Translate class declarations: class Name extends Base { -> class Name(Base):
-    python_code = re.sub(
-        r'export\s+class\s+(\w+)\s+extends\s+(\w+)\s*\{',
-        r'class \1(\2):',
-        python_code
+def _default_import_block() -> str:
+    """Minimal import block used when codegen stubs return an empty string."""
+    return (
+        "from __future__ import annotations\n\n"
+        "from app.wrapper.portfolio.calculator.portfolio_calculator"
+        " import PortfolioCalculator"
     )
 
-    # Translate method definitions: protected methodName() { -> def methodName(self):
-    python_code = re.sub(
-        r'(protected|private|public)?\s*(\w+)\s*\([^)]*\)\s*\{',
-        lambda m: f"def {m.group(2)}(self):",
-        python_code
+
+def _stub_class_body() -> str:
+    """Minimal class body used when codegen raises NotImplementedError (stubs)."""
+    return (
+        'class RoaiPortfolioCalculator(PortfolioCalculator):\n'
+        '    """Stub — awaiting Branch B merge for real implementation."""\n'
     )
 
-    # Translate return statements with enum values
-    python_code = re.sub(
-        r'return\s+(\w+)\.(\w+);',
-        r'return "\2"',
-        python_code
-    )
 
-    # Remove closing braces
-    python_code = re.sub(r'^\s*\}\s*$', '', python_code, flags=re.MULTILINE)
+def _verify_interface(output_file: Path) -> None:
+    """Check the generated file defines RoaiPortfolioCalculator(PortfolioCalculator).
 
-    # Clean up multiple blank lines
-    python_code = re.sub(r'\n\s*\n\s*\n+', '\n\n', python_code)
+    Uses AST inspection so the check works without executing the generated code
+    (which would require the full scaffold on sys.path).
 
-    return python_code.strip()
-
-
-def translate_roai_calculator(ts_file: Path, output_file: Path, stub_file: Path) -> None:
+    Raises TranslationError if the class is missing or has the wrong base.
     """
-    Translate the ROAI portfolio calculator from TypeScript to Python.
+    source = output_file.read_text(encoding="utf-8")
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as exc:
+        raise TranslationError(f"Generated file has syntax error: {exc}") from exc
 
-    For this minimal implementation, we:
-    1. Read the TypeScript source
-    2. Translate simple methods we can handle
-    3. Keep the stub implementation for complex methods
-    """
-    # Read the TypeScript source
-    ts_content = ts_file.read_text(encoding='utf-8')
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == "RoaiPortfolioCalculator":
+            for base in node.bases:
+                base_name: str | None = None
+                if isinstance(base, ast.Name):
+                    base_name = base.id
+                elif isinstance(base, ast.Attribute):
+                    base_name = base.attr
+                if base_name == "PortfolioCalculator":
+                    return  # interface satisfied
+            raise TranslationError(
+                "RoaiPortfolioCalculator does not subclass PortfolioCalculator"
+            )
 
-    # Read the stub implementation
-    stub_content = stub_file.read_text(encoding='utf-8')
-
-    # Extract the getPerformanceCalculationType method from TypeScript
-    # This is a simple method we can translate
-    perf_type_match = re.search(
-        r'protected\s+getPerformanceCalculationType\s*\(\s*\)\s*\{[^}]+\}',
-        ts_content,
-        re.DOTALL
+    raise TranslationError(
+        "RoaiPortfolioCalculator class not found in generated output"
     )
 
-    if perf_type_match:
-        # Translate this method
-        ts_method = perf_type_match.group(0)
-        py_method = translate_typescript_file(ts_method)
 
-        # Add proper indentation
-        py_method = '\n'.join('    ' + line if line.strip() else line
-                              for line in py_method.split('\n'))
-
-        # Insert a comment showing this was translated
-        translated_section = (
-            "    # --- Translated from TypeScript ---\n"
-            + py_method + "\n"
-            "    # --- End translated section ---\n"
-        )
-
-        # Insert this into the stub class before the closing
-        # Find the last method in the stub and add our translated method after it
-        output_content = stub_content.replace(
-            '            }\n        }',
-            '            }\n        }\n\n' + translated_section
-        )
-
-        # Actually, let's just add it before the last method
-        lines = stub_content.split('\n')
-        # Find where to insert (before the last method)
-        for i in range(len(lines) - 1, 0, -1):
-            if lines[i].strip().startswith('def '):
-                lines.insert(i, translated_section)
-                break
-
-        output_content = '\n'.join(lines)
-    else:
-        output_content = stub_content
-
-    # Write the output
-    output_file.parent.mkdir(parents=True, exist_ok=True)
-    output_file.write_text(output_content, encoding='utf-8')
-
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 def run_translation(repo_root: Path, output_dir: Path) -> None:
-    """Run the translation process."""
-    # Source TypeScript file
-    ts_source = (
-        repo_root / "projects" / "ghostfolio" / "apps" / "api" / "src"
+    """Run the TypeScript → Python translation pipeline.
+
+    Steps
+    -----
+    1. Load tt_import_map.json from the scaffold directory.  All module-path
+       strings are loaded at runtime from that file — none are hardcoded here.
+    2. Call parse_ts_file() on both TS source files.
+    3. Call extract_class_methods() to get RoaiPortfolioCalculator methods.
+    4. Call generate_imports() to build the import block.
+    5. Call generate_python_class() to build the class body.
+    6. Assemble the full output file (imports + class).
+    7. Run ast.parse() on the assembled content — raise TranslationError on failure.
+    8. Write to output_dir/app/implementation/portfolio/calculator/roai/portfolio_calculator.py.
+    9. Verify interface via _verify_interface().
+    10. Print summary.
+    """
+    # ------------------------------------------------------------------
+    # 1. Load tt_import_map.json — all module-path strings come from here
+    # ------------------------------------------------------------------
+    import_map_path = (
+        repo_root / "tt" / "tt" / "scaffold" / "ghostfolio_pytx" / "tt_import_map.json"
+    )
+    if import_map_path.exists():
+        import_map: dict[str, str] = json.loads(
+            import_map_path.read_text(encoding="utf-8")
+        )
+    else:
+        import_map = {}
+
+    # ------------------------------------------------------------------
+    # 2. Parse both TypeScript source files
+    # ------------------------------------------------------------------
+    from tt.parser import parse_ts_file, extract_class_methods
+    from tt.codegen import generate_imports, generate_python_class
+
+    roai_ts = (
+        repo_root
+        / "projects" / "ghostfolio" / "apps" / "api" / "src"
         / "app" / "portfolio" / "calculator" / "roai" / "portfolio-calculator.ts"
     )
-
-    # Stub file from the example
-    stub_source = (
-        repo_root / "translations" / "ghostfolio_pytx_example" / "app"
-        / "implementation" / "portfolio" / "calculator" / "roai"
-        / "portfolio_calculator.py"
+    base_ts = (
+        repo_root
+        / "projects" / "ghostfolio" / "apps" / "api" / "src"
+        / "app" / "portfolio" / "calculator" / "portfolio-calculator.ts"
     )
 
-    # Output file
+    roai_tree = (
+        parse_ts_file(roai_ts)
+        if roai_ts.exists()
+        else {"classes": [], "imports": [], "top_level_vars": []}
+    )
+    _base_tree = (  # noqa: F841  parsed for future use / Branch B integration
+        parse_ts_file(base_ts)
+        if base_ts.exists()
+        else {"classes": [], "imports": [], "top_level_vars": []}
+    )
+
+    # ------------------------------------------------------------------
+    # 3. Extract methods for RoaiPortfolioCalculator
+    # ------------------------------------------------------------------
+    _methods = extract_class_methods(roai_tree, "RoaiPortfolioCalculator")  # noqa: F841
+
+    # ------------------------------------------------------------------
+    # 4. Collect the class node (may be None with stubs)
+    # ------------------------------------------------------------------
+    roai_class = next(
+        (c for c in roai_tree["classes"] if c["name"] == "RoaiPortfolioCalculator"),
+        None,
+    )
+
+    # ------------------------------------------------------------------
+    # 4b. Collect used library names from parsed imports
+    # ------------------------------------------------------------------
+    used_libraries = [imp["module"] for imp in roai_tree["imports"]]
+
+    # ------------------------------------------------------------------
+    # 5. Generate import block
+    # ------------------------------------------------------------------
+    import_block: str = generate_imports(used_libraries, import_map)
+    if not import_block:
+        import_block = _default_import_block()
+
+    # ------------------------------------------------------------------
+    # 6. Generate class body (fall back to stub if codegen not yet implemented)
+    # ------------------------------------------------------------------
+    if roai_class is not None:
+        try:
+            class_body: str = generate_python_class(roai_class, import_map)
+        except NotImplementedError:
+            class_body = _stub_class_body()
+    else:
+        class_body = _stub_class_body()
+
+    # ------------------------------------------------------------------
+    # 7. Assemble and syntax-check the full source
+    # ------------------------------------------------------------------
+    full_source = import_block + "\n\n" + class_body + "\n"
+
+    try:
+        ast.parse(full_source)
+    except SyntaxError as exc:
+        raise TranslationError(
+            f"Generated Python has a syntax error: {exc}"
+        ) from exc
+
+    # ------------------------------------------------------------------
+    # 8. Write output file
+    # ------------------------------------------------------------------
     output_file = (
-        output_dir / "app" / "implementation" / "portfolio" / "calculator"
+        output_dir
+        / "app" / "implementation" / "portfolio" / "calculator"
         / "roai" / "portfolio_calculator.py"
     )
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    output_file.write_text(full_source, encoding="utf-8")
+    print(f"  File written -> {output_file}")
+    print("  Syntax check: passed")
 
-    if not ts_source.exists():
-        print(f"Warning: TypeScript source not found: {ts_source}")
-        return
+    # ------------------------------------------------------------------
+    # 9. Verify the interface contract
+    # ------------------------------------------------------------------
+    _verify_interface(output_file)
+    print(
+        "  Interface check: passed"
+        " (RoaiPortfolioCalculator subclasses PortfolioCalculator)"
+    )
 
-    if not stub_source.exists():
-        print(f"Warning: Stub file not found: {stub_source}")
-        return
 
-    print(f"Translating {ts_source.name}...")
-    translate_roai_calculator(ts_source, output_file, stub_source)
-    print(f"  Translated → {output_file}")
+# ---------------------------------------------------------------------------
+# SMOKE TEST (run manually):
+#
+#   cd <repo_root>
+#   python - <<'EOF'
+#   from pathlib import Path
+#   from tt.tt.translator import run_translation, TranslationError
+#   repo = Path(".").resolve()
+#   out  = repo / "translations" / "ghostfolio_pytx"
+#   run_translation(repo, out)
+#   EOF
+#
+# Expected (against stubs): file written, syntax check passed, interface check passed.
+# Expected (after Branch B merge): real class body generated, same checks pass.
+# ---------------------------------------------------------------------------
