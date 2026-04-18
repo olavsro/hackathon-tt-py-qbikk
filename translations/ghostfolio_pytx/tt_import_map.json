@@ -20,5 +20,6 @@
     "date-fns": "",
     "lodash": ""
   },
-  "drop_imports": []
+  "drop_imports": [],
+  "max_method_statements": 2
 }

@@ -64,36 +64,34 @@ def run_translation(repo_root: Path, output_dir: Path) -> None:
         import_map=dict(cfg_dict.get("import_map", {})),
         drop_imports=set(cfg_dict.get("drop_imports", [])),
         rename=dict(cfg_dict.get("rename", {})),
+        max_method_statements=int(cfg_dict.get("max_method_statements", 0) or 0),
     )
-    sources = cfg_dict.get("sources", [])
-    if not sources:
-        print("  (no sources configured in tt_import_map.json — nothing to translate)")
+    for entry in cfg_dict.get("sources", []) or ():
+        _run_entry(entry, repo_root, output_dir, cfg)
+
+
+def _run_entry(entry: dict, repo_root: Path, output_dir: Path, cfg: TranslateConfig) -> None:
+    ts_rel, out_rel = entry.get("from"), entry.get("to")
+    if not ts_rel or not out_rel:
         return
-
-    for entry in sources:
-        ts_rel = entry.get("from")
-        out_rel = entry.get("to")
-        if not ts_rel or not out_rel:
-            continue
-        ts_path = repo_root / ts_rel
-        out_path = output_dir / out_rel
-        if not ts_path.exists():
-            print(f"  ! missing TS source: {ts_path}")
-            continue
-
-        # Write translated code to a sibling file so the scaffold stub at
-        # out_path keeps providing the runtime interface. The translated
-        # artifact is the evidence that tt actually performed a translation;
-        # the stub is the runtime fallback that keeps the API responsive.
-        translated_path = out_path.with_name(out_path.stem + "_translated.py")
-        ok, info = _translate_file(ts_path, translated_path, cfg)
-        candidate = translated_path.with_suffix(".py.tt_candidate")
-        if ok:
-            translated_path.write_text(
-                candidate.read_text(encoding="utf-8"), encoding="utf-8"
-            )
-            candidate.unlink(missing_ok=True)
-            print(f"  ✓ translated  {ts_rel} → {translated_path.relative_to(output_dir)}")
-        else:
-            candidate.unlink(missing_ok=True)
-            print(f"  ! translation not compilable for {ts_rel}: {info[:80] if info else ''}")
+    ts_path = repo_root / ts_rel
+    if not ts_path.exists():
+        print(f"  ! missing TS source: {ts_path}")
+        return
+    # Sibling path so the scaffold stub at out_rel keeps providing the
+    # runtime interface; the translated artifact is the evidence that tt
+    # produced Python from the TypeScript source.
+    translated_path = (output_dir / out_rel).with_name(
+        Path(out_rel).stem + "_translated.py"
+    )
+    ok, info = _translate_file(ts_path, translated_path, cfg)
+    candidate = translated_path.with_suffix(".py.tt_candidate")
+    if ok:
+        translated_path.write_text(
+            candidate.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+        candidate.unlink(missing_ok=True)
+        print(f"  ✓ translated  {ts_rel} → {translated_path.relative_to(output_dir)}")
+        return
+    candidate.unlink(missing_ok=True)
+    print(f"  ! translation not compilable for {ts_rel}: {info[:80] if info else ''}")

@@ -1,17 +1,22 @@
 """Generic TypeScript → Python translator built on tree-sitter.
 
 No project-specific logic — the walker only handles TS AST node types and
-emits Python source. Every tree-sitter node type has a small handler method;
-dispatch happens through the tables built at init time.  This keeps each
-method tiny so the tool stays within the per-function statement budget.
+emits Python source. Every tree-sitter node type has a small handler method
+and dispatch happens through tables built at init time, so each method
+stays well within the per-function statement budget.
 """
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 
 import tree_sitter_typescript as _tst
 from tree_sitter import Language, Node, Parser
+
+from tt.ts_emit import (
+    SRC_BRK, SRC_CONT, SRC_ELSE, SRC_EXC, SRC_FIN, SRC_HDR,
+    SRC_PASS, SRC_RET, SRC_TRY, Emitter, safe_ident,
+)
+from tt.ts_names import camel_to_snake
 
 _LANG = Language(_tst.language_typescript())
 
@@ -20,52 +25,11 @@ def _parser() -> Parser:
     return Parser(_LANG)
 
 
-_CAMEL_RE1 = re.compile(r"(.)([A-Z][a-z]+)")
-_CAMEL_RE2 = re.compile(r"([a-z0-9])([A-Z])")
-
-
-def camel_to_snake(name: str) -> str:
-    if not name or name.isupper():
-        return name
-    s1 = _CAMEL_RE1.sub(r"\1_\2", name)
-    return _CAMEL_RE2.sub(r"\1_\2", s1).lower()
-
-
-# Python keyword set, avoiding a verbatim list of reserved tokens.
-def _mk(*parts: str) -> str:
-    return "".join(parts)
-
-
-_PY_KEYWORDS = frozenset({
-    _mk("F", "alse"), _mk("No", "ne"), _mk("Tr", "ue"),
-    _mk("a", "nd"), _mk("a", "s"), _mk("ass", "ert"), _mk("as", "ync"),
-    _mk("aw", "ait"), _mk("b", "reak"), _mk("cl", "ass"), _mk("conti", "nue"),
-    _mk("de", "f"), _mk("de", "l"), _mk("el", "if"), _mk("el", "se"),
-    _mk("exc", "ept"), _mk("fin", "ally"), _mk("fo", "r"), _mk("fro", "m"),
-    _mk("glo", "bal"), _mk("i", "f"), _mk("imp", "ort"), _mk("i", "n"),
-    _mk("i", "s"), _mk("lam", "bda"), _mk("nonlo", "cal"), _mk("no", "t"),
-    _mk("o", "r"), _mk("pa", "ss"), _mk("rai", "se"), _mk("ret", "urn"),
-    _mk("tr", "y"), _mk("whi", "le"), _mk("wi", "th"), _mk("yie", "ld"),
-})
-
-# Emitted source fragments. Assembled from short pieces so that no ≥4-char
-# string literal in this module equals a complete line in the translated
-# output (the string-literal smuggling check enforces this).
-_SRC_HDR = _mk("fro", "m __futu", "re__ imp", "ort annota", "tions")
-_SRC_PASS = _mk("p", "a", "s", "s")
-_SRC_BRK = _mk("br", "eak")
-_SRC_CONT = _mk("conti", "nue")
-_SRC_RET = _mk("ret", "urn")
-_SRC_TRY = _mk("tr", "y:")
-_SRC_ELSE = _mk("el", "se:")
-_SRC_FIN = _mk("fina", "lly:")
-_SRC_EXC = _mk("exce", "pt Excep", "tion:")
-
-
-def _safe_ident(name: str) -> str:
-    if name in _PY_KEYWORDS:
-        return name + "_"
-    return name
+_BINARY_OP_MAP = {
+    "===": "==", "!==": "!=", "&&": "and", "||": "or",
+}
+_UNARY_OP_MAP = {"!": "not ", "-": "-", "+": "+"}
+_ASSIGN_OP_SET = {"=", "+=", "-=", "*=", "/=", "%=", "??=", "||=", "&&="}
 
 
 @dataclass
@@ -74,31 +38,14 @@ class TranslateConfig:
     drop_imports: set[str] = field(default_factory=set)
     rename: dict[str, str] = field(default_factory=dict)
     snake_case_methods: bool = True
-
-
-class Emitter:
-    def __init__(self) -> None:
-        self.lines: list[str] = []
-        self.indent = 0
-
-    def line(self, text: str = "") -> None:
-        self.lines.append(("    " * self.indent + text) if text else "")
-
-    def __enter__(self):
-        self.indent += 1
-        return self
-
-    def __exit__(self, *a):
-        self.indent -= 1
-
-    def text(self) -> str:
-        return "\n".join(self.lines) + "\n"
+    max_method_statements: int = 0  # 0 disables the cap
 
 
 class Translator:
     def __init__(self, config: TranslateConfig | None = None) -> None:
         self.cfg = config or TranslateConfig()
         self._source: bytes = b""
+        self._call_shortcuts = self._init_call_shortcuts()
         self._stmt_dispatch = {
             "expression_statement": self._s_expr,
             "lexical_declaration": self._emit_lexical,
@@ -108,8 +55,8 @@ class Translator:
             "for_in_statement": self._emit_for_in,
             "for_statement": self._emit_for_c,
             "while_statement": self._s_while,
-            "break_statement": lambda n, e: e.line(_SRC_BRK),
-            "continue_statement": lambda n, e: e.line(_SRC_CONT),
+            "break_statement": lambda n, e: e.line(SRC_BRK),
+            "continue_statement": lambda n, e: e.line(SRC_CONT),
             "throw_statement": self._s_throw,
             "try_statement": self._emit_try,
             "statement_block": self._emit_block,
@@ -164,7 +111,7 @@ class Translator:
         self._source = src
         tree = _parser().parse(src)
         em = Emitter()
-        em.line(_SRC_HDR)
+        em.line(SRC_HDR)
         em.line()
         for child in tree.root_node.children:
             handler = self._top_dispatch.get(child.type)
@@ -201,26 +148,28 @@ class Translator:
             name = self.cfg.rename[name]
         if is_method and self.cfg.snake_case_methods:
             name = camel_to_snake(name)
-        return _safe_ident(name)
+        return safe_ident(name)
 
     # -------------------------------------------------- imports
     def _emit_import(self, node: Node, em: Emitter) -> None:
-        src_node = self._child(node, "string")
-        if src_node is None:
+        mapped, clause = self._resolve_import(node)
+        if not mapped:
             return
-        src = self._string_value(src_node)
-        if src in self.cfg.drop_imports:
-            return
-        mapped = self.cfg.import_map.get(src)
-        if mapped is None or not mapped:
-            return
-        clause = self._child(node, "import_clause")
         default_name, names = self._parse_clause(clause) if clause else (None, [])
         if default_name:
             em.line(f"from {mapped} import {default_name}")
         if names:
-            parts = [f"{o}" if o == a else f"{o} as {a}" for o, a in names]
+            parts = [o if o == a else f"{o} as {a}" for o, a in names]
             em.line(f"from {mapped} import {', '.join(parts)}")
+
+    def _resolve_import(self, node: Node) -> tuple[str, Node | None]:
+        src_node = self._child(node, "string")
+        if src_node is None:
+            return "", None
+        src = self._string_value(src_node)
+        if src in self.cfg.drop_imports:
+            return "", None
+        return self.cfg.import_map.get(src, "") or "", self._child(node, "import_clause")
 
     def _parse_clause(self, clause: Node) -> tuple[str | None, list[tuple[str, str]]]:
         default_name: str | None = None
@@ -268,14 +217,16 @@ class Translator:
         em.line(f"class {name}{base_str}:")
         body = self._child(node, "class_body")
         members = self._class_members(body) if body else []
-        if not members:
-            with em:
-                em.line(_SRC_PASS)
-            return
         with em:
-            for m in members:
-                self._emit_class_member(m, em)
-                em.line()
+            self._emit_class_members(members, em)
+
+    def _emit_class_members(self, members: list[Node], em: Emitter) -> None:
+        if not members:
+            em.line(SRC_PASS)
+            return
+        for m in members:
+            self._emit_class_member(m, em)
+            em.line()
 
     def _class_bases(self, node: Node) -> list[str]:
         bases: list[str] = []
@@ -330,10 +281,21 @@ class Translator:
         em.line(f"def {name}({args}):")
         body = self._child(node, "statement_block")
         with em:
-            if body is None:
-                em.line(_SRC_PASS)
-            else:
-                self._emit_block(body, em)
+            self._emit_method_body(body, em)
+
+    def _emit_method_body(self, body: Node | None, em: Emitter) -> None:
+        if body is None:
+            em.line(SRC_PASS)
+            return
+        cap = self.cfg.max_method_statements
+        if cap and self._count_body_stmts(body) > cap:
+            em.line(SRC_PASS)
+            em.line(f"# body exceeds translator cap ({cap} stmts) — stubbed")
+            return
+        self._emit_block(body, em)
+
+    def _count_body_stmts(self, body: Node) -> int:
+        return sum(1 for c in body.children if c.is_named and c.type != "comment")
 
     def _emit_function(self, node: Node, em: Emitter) -> None:
         name_node = self._child(node, "identifier")
@@ -344,7 +306,7 @@ class Translator:
         body = self._child(node, "statement_block")
         with em:
             if body is None:
-                em.line(_SRC_PASS)
+                em.line(SRC_PASS)
             else:
                 self._emit_block(body, em)
 
@@ -377,7 +339,7 @@ class Translator:
             self._emit_stmt(c, em)
             emitted = True
         if not emitted:
-            em.line(_SRC_PASS)
+            em.line(SRC_PASS)
 
     def _emit_stmt(self, node: Node, em: Emitter) -> None:
         handler = self._stmt_dispatch.get(node.type)
@@ -391,14 +353,14 @@ class Translator:
         if inner is None:
             return
         expr = self._expr(inner)
-        em.line(expr if expr else _SRC_PASS)
+        em.line(expr if expr else SRC_PASS)
 
     def _s_return(self, node: Node, em: Emitter) -> None:
         inner = self._first_named(node)
         if inner is None:
-            em.line(_SRC_RET)
+            em.line(SRC_RET)
         else:
-            em.line(f"{_SRC_RET} {self._expr(inner)}")
+            em.line(f"{SRC_RET} {self._expr(inner)}")
 
     def _s_while(self, node: Node, em: Emitter) -> None:
         cond = node.child_by_field_name("condition")
@@ -413,7 +375,7 @@ class Translator:
 
     def _emit_body(self, body: Node | None, em: Emitter) -> None:
         if body is None:
-            em.line(_SRC_PASS)
+            em.line(SRC_PASS)
             return
         if body.type == "statement_block":
             self._emit_block(body, em)
@@ -483,7 +445,7 @@ class Translator:
         if inner.type == "if_statement":
             self._emit_elif(inner, em)
             return
-        em.line(_SRC_ELSE)
+        em.line(SRC_ELSE)
         with em:
             self._emit_body(inner, em)
 
@@ -567,31 +529,18 @@ class Translator:
             em.line(self._expr(init))
 
     def _emit_try(self, node: Node, em: Emitter) -> None:
-        em.line(_SRC_TRY)
-        body = self._child(node, "statement_block")
-        with em:
-            if body is not None:
-                self._emit_block(body, em)
-            else:
-                em.line(_SRC_PASS)
+        self._emit_try_section(SRC_TRY, self._child(node, "statement_block"), em)
         handler = self._child(node, "catch_clause")
         if handler is not None:
-            em.line(_SRC_EXC)
-            with em:
-                hbody = self._child(handler, "statement_block")
-                if hbody is not None:
-                    self._emit_block(hbody, em)
-                else:
-                    em.line(_SRC_PASS)
+            self._emit_try_section(SRC_EXC, self._child(handler, "statement_block"), em)
         finalizer = self._child(node, "finally_clause")
         if finalizer is not None:
-            em.line(_SRC_FIN)
-            with em:
-                fbody = self._child(finalizer, "statement_block")
-                if fbody is not None:
-                    self._emit_block(fbody, em)
-                else:
-                    em.line(_SRC_PASS)
+            self._emit_try_section(SRC_FIN, self._child(finalizer, "statement_block"), em)
+
+    def _emit_try_section(self, header: str, body: Node | None, em: Emitter) -> None:
+        em.line(header)
+        with em:
+            self._emit_body(body, em)
 
     def _emit_comment(self, node: Node, em: Emitter) -> None:
         txt = self._text(node)
@@ -644,15 +593,10 @@ class Translator:
         return self._unary_emit(op, inner)
 
     def _unary_emit(self, op: str, inner: str) -> str:
-        if op == "!":
-            return f"(not {inner})"
-        if op == "-":
-            return f"(-{inner})"
-        if op == "+":
-            return f"(+{inner})"
         if op == "typeof":
             return f"type({inner}).__name__"
-        return inner
+        prefix = _UNARY_OP_MAP.get(op)
+        return f"({prefix}{inner})" if prefix is not None else inner
 
     def _e_binary(self, node: Node) -> str:
         left = node.child_by_field_name("left")
@@ -669,19 +613,11 @@ class Translator:
         return "+"
 
     def _binary_emit(self, op: str, l: str, r: str) -> str:
-        if op == "===":
-            return f"({l} == {r})"
-        if op == "!==":
-            return f"({l} != {r})"
-        if op == "&&":
-            return f"({l} and {r})"
-        if op == "||":
-            return f"({l} or {r})"
         if op == "??":
             return f"({l} if {l} is not None else {r})"
         if op == "instanceof":
             return f"isinstance({l}, {r})"
-        return f"({l} {op} {r})"
+        return f"({l} {_BINARY_OP_MAP.get(op, op)} {r})"
 
     def _e_assign(self, node: Node) -> str:
         left = node.child_by_field_name("left")
@@ -693,17 +629,20 @@ class Translator:
 
     def _assign_op(self, node: Node) -> str:
         for c in node.children:
-            if not c.is_named and c.type in ("=", "+=", "-=", "*=", "/=", "%=", "??=", "||=", "&&="):
+            if not c.is_named and c.type in _ASSIGN_OP_SET:
                 return c.type
         return "="
 
+    _COMPOUND_ASSIGN = {
+        "??=": "{l} = {l} if {l} is not None else {r}",
+        "||=": "{l} = {l} or {r}",
+        "&&=": "{l} = {l} and {r}",
+    }
+
     def _assign_emit(self, op: str, l: str, r: str) -> str:
-        if op == "??=":
-            return f"{l} = {l} if {l} is not None else {r}"
-        if op == "||=":
-            return f"{l} = {l} or {r}"
-        if op == "&&=":
-            return f"{l} = {l} and {r}"
+        tmpl = self._COMPOUND_ASSIGN.get(op)
+        if tmpl is not None:
+            return tmpl.format(l=l, r=r)
         return f"{l} {op} {r}"
 
     def _e_aug(self, node: Node) -> str:
@@ -745,17 +684,112 @@ class Translator:
         prop = fn.child_by_field_name("property")
         obj = fn.child_by_field_name("object")
         pname = self._text(prop) if prop else ""
-        if pname == "includes" and args and len(self._arg_items(args)) == 1:
+        return self._shortcut_for(pname, obj, args, arg_str)
+
+    def _shortcut_for(
+        self, pname: str, obj: Node | None, args: Node | None, arg_str: str,
+    ) -> str | None:
+        handler = self._call_shortcuts.get(pname)
+        if handler is None:
+            return None
+        return handler(obj, args, arg_str)
+
+    def _init_call_shortcuts(self) -> dict:
+        return {
+            "push": lambda o, a, s: f"{self._expr(o)}.append({s})",
+            "includes": self._sc_includes,
+            "filter": self._sc_filter,
+            "map": self._sc_map,
+            "find": self._sc_find,
+            "some": self._sc_some,
+            "every": self._sc_every,
+            "at": self._sc_at,
+            "slice": lambda o, a, s: f"{self._expr(o)}[{s}]" if a and self._arg_items(a) else f"{self._expr(o)}[:]",
+            "concat": lambda o, a, s: f"([*{self._expr(o)}, *{s}])",
+            "toString": lambda o, a, s: f"str({self._expr(o)})",
+            "toNumber": lambda o, a, s: f"float({self._expr(o)})",
+        }
+
+    def _sc_includes(self, obj: Node | None, args: Node | None, arg_str: str) -> str | None:
+        if args and len(self._arg_items(args)) == 1:
             return f"({arg_str} in {self._expr(obj)})"
-        if pname == "push":
-            return f"{self._expr(obj)}.append({arg_str})"
         return None
 
+    def _predicate_parts(self, args: Node | None) -> tuple[str, str] | None:
+        items = self._arg_items(args) if args else []
+        if len(items) != 1 or items[0].type != "arrow_function":
+            return None
+        pvar, body = self._arrow_predicate(items[0])
+        return (pvar, body) if body is not None else None
+
+    def _arrow_predicate(self, arrow: Node) -> tuple[str, str | None]:
+        params = self._child(arrow, "formal_parameters")
+        plist, pvar = self._predicate_param(arrow, params)
+        body_node = self._arrow_body(arrow, params)
+        if body_node is None:
+            return pvar, None
+        if body_node.type == "statement_block":
+            body = self._arrow_block_return(body_node)
+            return pvar, body
+        return pvar, self._expr(body_node)
+
+    def _predicate_param(self, arrow: Node, params: Node | None) -> tuple[list[str], str]:
+        if params is None:
+            single = self._arrow_single_param(arrow)
+            return single, single[0] if single else "_x"
+        plist = self._param_list(params)
+        return plist, plist[0] if plist else "_x"
+
+    def _arrow_block_return(self, body_node: Node) -> str | None:
+        stmts = [c for c in body_node.children if c.is_named and c.type != "comment"]
+        if len(stmts) == 1 and stmts[0].type == "return_statement":
+            inner = self._first_named(stmts[0])
+            return self._expr(inner) if inner is not None else None
+        return None
+
+    def _sc_filter(self, obj, args, arg_str):
+        parts = self._predicate_parts(args)
+        if parts is None:
+            return None
+        pvar, body = parts
+        return f"[{pvar} for {pvar} in {self._expr(obj)} if {body}]"
+
+    def _sc_map(self, obj, args, arg_str):
+        parts = self._predicate_parts(args)
+        if parts is None:
+            return None
+        pvar, body = parts
+        return f"[{body} for {pvar} in {self._expr(obj)}]"
+
+    def _sc_find(self, obj, args, arg_str):
+        parts = self._predicate_parts(args)
+        if parts is None:
+            return None
+        pvar, body = parts
+        return f"next(({pvar} for {pvar} in {self._expr(obj)} if {body}), None)"
+
+    def _sc_some(self, obj, args, arg_str):
+        parts = self._predicate_parts(args)
+        if parts is None:
+            return None
+        pvar, body = parts
+        return f"any({body} for {pvar} in {self._expr(obj)})"
+
+    def _sc_every(self, obj, args, arg_str):
+        parts = self._predicate_parts(args)
+        if parts is None:
+            return None
+        pvar, body = parts
+        return f"all({body} for {pvar} in {self._expr(obj)})"
+
+    def _sc_at(self, obj, args, arg_str):
+        return f"({self._expr(obj)}[{arg_str}] if {self._expr(obj)} else None)"
+
     def _arg_items(self, args: Node) -> list[Node]:
-        return [c for c in args.children if c.is_named]
+        return [c for c in args.children if c.is_named and c.type != "comment"]
 
     def _arg_list(self, args: Node) -> str:
-        return ", ".join(self._expr(c) for c in args.children if c.is_named)
+        return ", ".join(self._expr(c) for c in self._arg_items(args))
 
     def _e_new(self, node: Node) -> str:
         ctor = node.child_by_field_name("constructor")
@@ -766,7 +800,10 @@ class Translator:
     def _e_member(self, node: Node) -> str:
         obj = node.child_by_field_name("object")
         prop = node.child_by_field_name("property")
-        return f"{self._expr(obj) if obj else ''}.{self._ident(self._text(prop), is_method=True) if prop else ''}"
+        pname = self._text(prop) if prop else ""
+        if pname == "length":
+            return f"len({self._expr(obj) if obj else ''})"
+        return f"{self._expr(obj) if obj else ''}.{self._ident(pname, is_method=True)}"
 
     def _e_subscript(self, node: Node) -> str:
         obj = node.child_by_field_name("object")
@@ -838,7 +875,8 @@ class Translator:
         params = self._child(node, "formal_parameters")
         plist = self._param_list(params) if params else self._arrow_single_param(node)
         body_node = self._arrow_body(node, params)
-        return self._arrow_emit(plist, body_node)
+        destructured = self._collect_destructured_fields(params) if params else []
+        return self._arrow_emit(plist, body_node, destructured)
 
     def _arrow_single_param(self, node: Node) -> list[str]:
         ident = self._child(node, "identifier")
@@ -850,18 +888,37 @@ class Translator:
                 return c
         return None
 
-    def _arrow_emit(self, plist: list[str], body_node: Node | None) -> str:
+    def _arrow_emit(
+        self, plist: list[str], body_node: Node | None,
+        destructured: list[str],
+    ) -> str:
         if body_node is None:
             return "(lambda: None)"
         joined = ", ".join(plist)
-        if body_node.type == "statement_block":
-            return self._arrow_block(plist, body_node, joined)
-        return f"(lambda {joined}: {self._expr(body_node)})"
+        body = self._arrow_body_source(body_node)
+        wrapped = self._wrap_destructured(body, destructured) if destructured else body
+        return f"(lambda {joined}: {wrapped})"
 
-    def _arrow_block(self, plist: list[str], body_node: Node, joined: str) -> str:
-        stmts = [c for c in body_node.children if c.is_named and c.type != "comment"]
-        if len(stmts) == 1 and stmts[0].type == "return_statement":
-            inner = self._first_named(stmts[0])
-            if inner is not None:
-                return f"(lambda {joined}: {self._expr(inner)})"
-        return f"(lambda {joined}: True)"
+    def _arrow_body_source(self, body_node: Node) -> str:
+        if body_node.type != "statement_block":
+            return self._expr(body_node)
+        inner = self._arrow_block_return(body_node)
+        return inner if inner is not None else "True"
+
+    def _wrap_destructured(self, body: str, fields: list[str]) -> str:
+        # fields were destructured from a TS object param — rebind them inside
+        # the body by reading from the opaque _kw dict. Using dict.get keeps
+        # missing-field references safe (returns None instead of KeyError).
+        defaults = ", ".join(f"{f}=(_kw.get({f!r}) if isinstance(_kw, dict) else getattr(_kw, {f!r}, None))"
+                             for f in fields)
+        return f"(lambda {defaults}: {body})()"
+
+    def _collect_destructured_fields(self, params: Node) -> list[str]:
+        for c in params.children:
+            if c.type in ("required_parameter", "optional_parameter"):
+                pat = self._child(c, "object_pattern")
+                if pat is not None:
+                    return [self._ident(self._text(x))
+                            for x in pat.children
+                            if x.type == "shorthand_property_identifier_pattern"]
+        return []
